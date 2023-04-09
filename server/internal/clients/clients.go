@@ -77,9 +77,13 @@ func (cl *Clients) Len() int {
 }
 
 // Delete removes a client from the internal map.
-func (cl *Clients) Delete(id string) {
+func (cl *Clients) Delete(val *Client) {
 	cl.Lock()
-	delete(cl.internal, id)
+	if old, ok := cl.internal[val.ID]; ok {
+		if atomic.LoadUint32(&old.State.Done) == 1 {
+			delete(cl.internal, val.ID)
+		}
+	}
 	cl.Unlock()
 }
 
