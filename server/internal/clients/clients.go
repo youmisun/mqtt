@@ -118,7 +118,6 @@ type Client struct {
 // State tracks the state of the client.
 type State struct {
 	started   *sync.WaitGroup // tracks the goroutines which have been started.
-	endedW    *sync.WaitGroup // tracks when the writer has ended.
 	Done      uint32          // atomic counter which indicates that the client has closed.
 	endOnce   sync.Once       // only end once.
 	stopCause atomic.Value    // reason for stopping.
@@ -137,7 +136,6 @@ func NewClient(c net.Conn, w *circ.Writer, s *system.Info) *Client {
 		Subscriptions: make(map[string]byte),
 		State: State{
 			started: new(sync.WaitGroup),
-			endedW:  new(sync.WaitGroup),
 		},
 	}
 
@@ -243,7 +241,6 @@ func (cl *Client) ForgetSubscription(filter string) {
 // Start begins the client goroutines reading and writing packets.
 func (cl *Client) Start() {
 	cl.State.started.Add(1)
-	cl.State.endedW.Add(1)
 
 	go func() {
 		cl.State.started.Done()
@@ -251,17 +248,10 @@ func (cl *Client) Start() {
 		if err != nil {
 			err = fmt.Errorf("writer: %w", err)
 		}
-		cl.State.endedW.Done()
 		cl.Stop(err)
 	}()
 
 	cl.State.started.Wait()
-}
-
-// ClearBuffers sets the read/write buffers to nil so they can be
-// deallocated automatically when no longer in use.
-func (cl *Client) ClearBuffers() {
-	cl.W = nil
 }
 
 // Stop instructs the client to shut down all processing goroutines and disconnect.
@@ -273,8 +263,6 @@ func (cl *Client) Stop(err error) {
 
 	cl.State.endOnce.Do(func() {
 		cl.W.Stop()
-
-		cl.State.endedW.Wait()
 
 		_ = cl.conn.Close() // omit close error
 
@@ -312,6 +300,7 @@ func (cl *Client) ReadFixedHeader(fh *packets.FixedHeader) error {
 	if err != nil {
 		return err
 	}
+	n := int64(vbi.Len())
 
 	fh.Remaining, err = decodeVBI(vbi)
 	if err != nil {
@@ -319,7 +308,7 @@ func (cl *Client) ReadFixedHeader(fh *packets.FixedHeader) error {
 	}
 
 	// Having successfully read n bytes, commit the tail forward.
-	//atomic.AddInt64(&cl.systemInfo.BytesRecv, n)
+	atomic.AddInt64(&cl.systemInfo.BytesRecv, n)
 
 	return nil
 }

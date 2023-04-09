@@ -298,7 +298,6 @@ func (s *Server) EstablishConnection(lid string, c net.Conn, ac auth.Controller)
 	)
 
 	cl.Start()
-	defer cl.ClearBuffers()
 	defer cl.Stop(nil)
 
 	pk, err := s.readConnectionPacket(cl)
