@@ -289,13 +289,10 @@ func (s *Server) onStorage(cl events.Clientlike, err error) {
 // EstablishConnection establishes a new client when a listener
 // accepts a new connection.
 func (s *Server) EstablishConnection(lid string, c net.Conn, ac auth.Controller) error {
-	xbr := s.bytepool.Get() // Get byte buffer from pools for receiving packet data.
 	xbw := s.bytepool.Get() // and for sending.
-	defer s.bytepool.Put(xbr)
 	defer s.bytepool.Put(xbw)
 
 	cl := clients.NewClient(c,
-		circ.NewReaderFromSlice(s.Options.BufferBlockSize, xbr),
 		circ.NewWriterFromSlice(s.Options.BufferBlockSize, xbw),
 		s.System,
 	)
@@ -482,7 +479,7 @@ func (s *Server) processPacket(cl *clients.Client, pk packets.Packet) error {
 		}
 		return s.processUnsubscribe(cl, pk)
 	default:
-		return fmt.Errorf("No valid packet available; %v", pk.FixedHeader.Type)
+		return fmt.Errorf("no valid packet available; %v", pk.FixedHeader.Type)
 	}
 }
 

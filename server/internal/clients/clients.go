@@ -2,9 +2,9 @@ package clients
 
 import (
 	"bytes"
-	"encoding/binary"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"sync"
 	"sync/atomic"
@@ -107,7 +107,6 @@ type Client struct {
 	Listener      string               // the id of the listener the client is connected to.
 	ID            string               // the client id.
 	conn          net.Conn             // the net.Conn used to establish the connection.
-	R             *circ.Reader         // a reader for reading incoming bytes.
 	W             *circ.Writer         // a writer for writing outgoing bytes.
 	Subscriptions topics.Subscriptions // a map of the subscription filters a client maintains.
 	systemInfo    *system.Info         // pointers to server system info.
@@ -120,17 +119,15 @@ type Client struct {
 type State struct {
 	started   *sync.WaitGroup // tracks the goroutines which have been started.
 	endedW    *sync.WaitGroup // tracks when the writer has ended.
-	endedR    *sync.WaitGroup // tracks when the reader has ended.
 	Done      uint32          // atomic counter which indicates that the client has closed.
 	endOnce   sync.Once       // only end once.
 	stopCause atomic.Value    // reason for stopping.
 }
 
 // NewClient returns a new instance of Client.
-func NewClient(c net.Conn, r *circ.Reader, w *circ.Writer, s *system.Info) *Client {
+func NewClient(c net.Conn, w *circ.Writer, s *system.Info) *Client {
 	cl := &Client{
 		conn:       c,
-		R:          r,
 		W:          w,
 		systemInfo: s,
 		keepalive:  defaultKeepalive,
@@ -141,7 +138,6 @@ func NewClient(c net.Conn, r *circ.Reader, w *circ.Writer, s *system.Info) *Clie
 		State: State{
 			started: new(sync.WaitGroup),
 			endedW:  new(sync.WaitGroup),
-			endedR:  new(sync.WaitGroup),
 		},
 	}
 
@@ -174,7 +170,6 @@ func (cl *Client) Identify(lid string, pk packets.Packet, ac auth.Controller) {
 		cl.ID = xid.New().String()
 	}
 
-	cl.R.ID = cl.ID + " READER"
 	cl.W.ID = cl.ID + " WRITER"
 
 	cl.Username = pk.Username
@@ -247,9 +242,8 @@ func (cl *Client) ForgetSubscription(filter string) {
 
 // Start begins the client goroutines reading and writing packets.
 func (cl *Client) Start() {
-	cl.State.started.Add(2)
+	cl.State.started.Add(1)
 	cl.State.endedW.Add(1)
-	cl.State.endedR.Add(1)
 
 	go func() {
 		cl.State.started.Done()
@@ -261,23 +255,12 @@ func (cl *Client) Start() {
 		cl.Stop(err)
 	}()
 
-	go func() {
-		cl.State.started.Done()
-		_, err := cl.R.ReadFrom(cl.conn)
-		if err != nil {
-			err = fmt.Errorf("reader: %w", err)
-		}
-		cl.State.endedR.Done()
-		cl.Stop(err)
-	}()
-
 	cl.State.started.Wait()
 }
 
 // ClearBuffers sets the read/write buffers to nil so they can be
 // deallocated automatically when no longer in use.
 func (cl *Client) ClearBuffers() {
-	cl.R = nil
 	cl.W = nil
 }
 
@@ -289,14 +272,12 @@ func (cl *Client) Stop(err error) {
 	}
 
 	cl.State.endOnce.Do(func() {
-		cl.R.Stop()
 		cl.W.Stop()
 
 		cl.State.endedW.Wait()
 
 		_ = cl.conn.Close() // omit close error
 
-		cl.State.endedR.Wait()
 		atomic.StoreUint32(&cl.State.Done, 1)
 
 		if err == nil {
@@ -316,7 +297,8 @@ func (cl *Client) StopCause() error {
 
 // ReadFixedHeader reads in the values of the next packet's fixed header.
 func (cl *Client) ReadFixedHeader(fh *packets.FixedHeader) error {
-	p, err := cl.R.Read(1)
+	p := make([]byte, 1)
+	_, err := io.ReadFull(cl.conn, p)
 	if err != nil {
 		return err
 	}
@@ -326,48 +308,59 @@ func (cl *Client) ReadFixedHeader(fh *packets.FixedHeader) error {
 		return err
 	}
 
-	// The remaining length value can be up to 5 bytes. Read through each byte
-	// looking for continue values, and if found increase the read. Otherwise
-	// decode the bytes that were legit.
-	buf := make([]byte, 0, 6)
-	i := 1
-	n := 2
-	for ; n < 6; n++ {
-		p, err = cl.R.Read(n)
-		if err != nil {
-			return err
-		}
-
-		buf = append(buf, p[i])
-
-		// If it's not a continuation flag, end here.
-		if p[i] < 128 {
-			break
-		}
-
-		// If i has reached 4 without a length terminator, return a protocol violation.
-		i++
-		if i == 4 {
-			return packets.ErrOversizedLengthIndicator
-		}
+	vbi, err := getVBI(cl.conn)
+	if err != nil {
+		return err
 	}
 
-	// Calculate and store the remaining length of the packet payload.
-	rem, _ := binary.Uvarint(buf)
-	fh.Remaining = int(rem)
+	fh.Remaining, err = decodeVBI(vbi)
+	if err != nil {
+		return err
+	}
 
 	// Having successfully read n bytes, commit the tail forward.
-	cl.R.CommitTail(n)
-	atomic.AddInt64(&cl.systemInfo.BytesRecv, int64(n))
+	//atomic.AddInt64(&cl.systemInfo.BytesRecv, n)
 
 	return nil
+}
+
+func getVBI(r io.Reader) (*bytes.Buffer, error) {
+	var ret bytes.Buffer
+	digit := [1]byte{}
+	for {
+		_, err := io.ReadFull(r, digit[:])
+		if err != nil {
+			return nil, err
+		}
+		ret.WriteByte(digit[0])
+		if digit[0] <= 0x7f {
+			return &ret, nil
+		}
+	}
+}
+
+func decodeVBI(r *bytes.Buffer) (int, error) {
+	var vbi uint32
+	var multiplier uint32
+	for {
+		digit, err := r.ReadByte()
+		if err != nil && err != io.EOF {
+			return 0, err
+		}
+		vbi |= uint32(digit&127) << multiplier
+		if (digit & 128) == 0 {
+			break
+		}
+		multiplier += 7
+	}
+	return int(vbi), nil
 }
 
 // Read loops forever reading new packets from a client connection until
 // an error is encountered (or the connection is closed).
 func (cl *Client) Read(packetHandler func(*Client, packets.Packet) error) error {
 	for {
-		if atomic.LoadUint32(&cl.State.Done) == 1 && cl.R.CapDelta() == 0 {
+		if atomic.LoadUint32(&cl.State.Done) == 1 {
 			return nil
 		}
 
@@ -399,15 +392,16 @@ func (cl *Client) ReadPacket(fh *packets.FixedHeader) (pk packets.Packet, err er
 		return
 	}
 
-	p, err := cl.R.Read(pk.FixedHeader.Remaining)
+	px := make([]byte, pk.FixedHeader.Remaining)
+	n, err := io.ReadFull(cl.conn, px)
 	if err != nil {
 		return pk, err
 	}
-	atomic.AddInt64(&cl.systemInfo.BytesRecv, int64(len(p)))
-
-	// Decode the remaining packet values using a fresh copy of the bytes,
-	// otherwise the next packet will change the data of this one.
-	px := append([]byte{}, p[:]...)
+	if n != pk.FixedHeader.Remaining {
+		err = errors.New("failed to read expected data")
+		return
+	}
+	atomic.AddInt64(&cl.systemInfo.BytesRecv, int64(n))
 
 	switch pk.FixedHeader.Type {
 	case packets.Connect:
@@ -441,8 +435,6 @@ func (cl *Client) ReadPacket(fh *packets.FixedHeader) (pk packets.Packet, err er
 	default:
 		err = fmt.Errorf("no valid packet available; %v", pk.FixedHeader.Type)
 	}
-
-	cl.R.CommitTail(pk.FixedHeader.Remaining)
 
 	return
 }
@@ -504,8 +496,6 @@ func (cl *Client) WritePacket(pk packets.Packet) (n int, err error) {
 
 	atomic.AddInt64(&cl.systemInfo.BytesSent, int64(n))
 	atomic.AddInt64(&cl.systemInfo.MessagesSent, 1)
-
-	cl.refreshDeadline(cl.keepalive)
 
 	return
 }

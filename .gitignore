@@ -1,3 +1,4 @@
 cmd/mqtt
 .DS_Store
 server/persistence/bolt/testbolt.db
+/.idea/
